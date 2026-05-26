@@ -1,0 +1,26 @@
+PROJECT AETHER - IMPLEMENTATION AND ARCHITECTURE SPECIFICATION
+
+Overview
+Project Aether is a distributed intelligence network designed to aggregate, index, and query unstructured enterprise knowledge bases. The core goal of the project is to achieve sub-second latency for complex semantic queries over high-dimensional vector spaces.
+
+Architectural Components
+1. Distributed Loaders: Ingest documents from cloud endpoints (AWS S3, Google Cloud Storage, Azure Blob Storage). Supported formats include PDF, DOCX, XLSX, TXT, and Markdown.
+2. Vector Ingestion Pipeline: Extracted text is processed by standard NLP sentence splitters, generating chunks of 1000 tokens with 200 tokens overlap.
+3. Multi-Model Embedding Layer: Integrates local sentence-transformers (such as all-MiniLM-L6-v2) alongside enterprise cloud APIs (OpenAI text-embedding-3, Gemini embeddings-001).
+4. Semantic Store: Uses hierarchical navigable small world (HNSW) graphs implemented in FAISS or ChromaDB. Confirmed vector dimension is 384 for local models and 1536 for OpenAI models.
+5. Synthesis Engine: A specialized LLM router that dynamically channels user queries to specific models depending on complexity. It uses Groq (Llama 3.1) for low-latency queries and Anthropic Claude 3.5 Sonnet for high-reasoning tasks.
+
+Performance Thresholds
+- Load Ingestion Rate: Target 50 pages per second.
+- Retrieval Time (Top 5 Chunks): Target < 45 milliseconds.
+- LLM Time to First Token (TTFT): Target < 350 milliseconds.
+- Grounding Index: Grounded response threshold target is 98.4% accuracy. Hallucinations exceeding 0.5% are rejected by the validator.
+
+API Configuration Details
+The server exposes REST endpoints on port 8080.
+- POST /api/v1/ingest - Upload documents.
+- POST /api/v1/query - Returns JSON answers with retrieved metadata sources.
+- GET /api/v1/health - Check container connection state and API credentials.
+
+System Contact
+For questions regarding the architecture, contact Principal AI Architect Alice Vance (alice.vance@aethernet.io) or Tech Lead Bob Smith (bob.smith@aethernet.io).
