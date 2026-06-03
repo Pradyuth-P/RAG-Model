@@ -244,3 +244,22 @@ class FAISSVectorStore(BaseVectorStore):
         except Exception as e:
             logger.error(f"Error clearing vector store for session {session_id}: {str(e)}")
             return False
+
+def get_vector_store(storage_dir: str = "storage", uploads_dir: str = "uploads") -> BaseVectorStore:
+    """
+    Factory function using the Strategy pattern to return the configured vector store.
+    """
+    provider = os.getenv("VECTOR_DB_PROVIDER", "faiss").strip().lower()
+    faiss_fallback = FAISSVectorStore(storage_dir=storage_dir, uploads_dir=uploads_dir)
+
+    if provider == "pinecone":
+        from app.services.vector_adapters.pinecone_adapter import PineconeAdapter
+        return PineconeAdapter(faiss_fallback)
+    elif provider == "qdrant":
+        from app.services.vector_adapters.qdrant_adapter import QdrantAdapter
+        return QdrantAdapter(faiss_fallback)
+    elif provider == "weaviate":
+        from app.services.vector_adapters.weaviate_adapter import WeaviateAdapter
+        return WeaviateAdapter(faiss_fallback)
+    else:
+        return faiss_fallback

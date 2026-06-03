@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 # Imports
 from app.models.schemas import ChatRequest, DocumentResponse, DeleteResponse, HealthResponse
 from app.services.embedding_service import EmbeddingService
-from app.services.vector_service import FAISSVectorStore
+from app.services.vector_service import get_vector_store
 from app.services.llm_service import LLMService
 from app.services.rag_service import RAGService
 from app.services.langsmith_config import init_langsmith
@@ -22,13 +22,11 @@ router = APIRouter(prefix="/api")
 
 # Singletons for services
 embedding_service = EmbeddingService()
-vector_store = FAISSVectorStore()
+vector_store = get_vector_store()
 llm_service = LLMService()
 rag_service = RAGService(embedding_service, vector_store, llm_service)
 
-# Simple in-memory session database for storing messages history
-# session_id -> list of messages
-sessions_db = {}
+# session memory is now managed by rag_service.session_memory
 
 @router.post("/upload", response_model=DocumentResponse)
 async def upload_document(
@@ -92,6 +90,12 @@ async def upload_document(
         raise HTTPException(status_code=500, detail=f"Failed to ingest document: {str(e)}")
 
 
+from app.services.guardrails import PIIMasker, PromptInjectionFilter, OutputGuard
+
+pii_masker = PIIMasker()
+prompt_filter = PromptInjectionFilter()
+output_guard = OutputGuard()
+
 @router.post("/chat")
 async def chat_endpoint(request: ChatRequest, session_id: Optional[str] = Query(None)):
     """
@@ -108,16 +112,30 @@ async def chat_endpoint(request: ChatRequest, session_id: Optional[str] = Query(
             detail=f"LLM Provider '{request.provider}' is not configured. Please supply its API key in the environment."
         )
 
-    # Initialize session messages if not exists
-    if current_session not in sessions_db:
-        sessions_db[current_session] = []
+    # 1. Input Guardrail: Prompt Injection Detection
+    if prompt_filter.is_injection(request.query):
+        raise HTTPException(
+            status_code=400,
+            detail="Safety Alert: Query was flagged as a potential prompt injection attack."
+        )
 
-    # Store user message
-    sessions_db[current_session].append({
+    # 2. Input Guardrail: PII Masking
+    masked_query = pii_masker.mask(request.query)
+
+    # Store user message using memory service
+    user_msg = {
         "role": "user",
-        "content": request.query,
+        "content": masked_query,
         "timestamp": datetime.utcnow().isoformat()
-    })
+    }
+    rag_service.session_memory.save_message(current_session, user_msg)
+
+    # Dynamic conversation summary generation (Phase 6 Memory)
+    rag_service.summary_memory.update_summary_if_needed(
+        session_id=current_session,
+        llm_provider=request.provider,
+        llm_model=request.model
+    )
 
     async def sse_generator():
         bot_response_tokens = []
@@ -125,14 +143,10 @@ async def chat_endpoint(request: ChatRequest, session_id: Optional[str] = Query(
         
         try:
             # We obtain RAG stream
-            # The prompt requires: embedding_provider matches request settings. 
-            # For simplicity, we assume default_embedding_provider or let settings specify it.
-            # In a real system, the client could pass embedding_provider in settings.
-            # Let's read DEFAULT_EMBEDDING_PROVIDER for now or align with client choice.
             embedding_prov = os.getenv("DEFAULT_EMBEDDING_PROVIDER", "huggingface")
 
             async for event in rag_service.generate_response_stream(
-                query=request.query,
+                query=masked_query,
                 embedding_provider=embedding_prov,
                 llm_provider=request.provider,
                 session_id=current_session,
@@ -149,14 +163,28 @@ async def chat_endpoint(request: ChatRequest, session_id: Optional[str] = Query(
                 # Format to SSE standard: "data: <json>\n\n"
                 yield f"data: {json.dumps(event)}\n\n"
 
-            # Store finished bot response in session db
+            # 3. Output Guardrail: Content & Safety compliance check
             full_response = "".join(bot_response_tokens)
-            sessions_db[current_session].append({
+            safety_check = output_guard.validate_output(full_response)
+            
+            if not safety_check["is_safe"]:
+                logger.warning(f"Output Guardrail triggered: {safety_check['violation_type']} - {safety_check['reason']}")
+                # Yield error event
+                err_msg = f"Safety Alert: Response blocked due to policy violation: {safety_check['reason']}"
+                yield f"data: {json.dumps({'type': 'error', 'content': err_msg})}\n\n"
+                # Override the saved message
+                saved_content = "Response blocked: The generated content violated safety policy."
+            else:
+                saved_content = full_response
+
+            # Store finished bot response in session db using memory service
+            assistant_msg = {
                 "role": "assistant",
-                "content": full_response,
+                "content": saved_content,
                 "sources": retrieved_sources,
                 "timestamp": datetime.utcnow().isoformat()
-            })
+            }
+            rag_service.session_memory.save_message(current_session, assistant_msg)
 
         except Exception as e:
             logger.error(f"Stream error: {str(e)}")
@@ -217,7 +245,7 @@ def get_history(session_id: str = "default_session"):
     """
     Returns messages history for a session.
     """
-    return sessions_db.get(session_id, [])
+    return rag_service.session_memory.get_messages(session_id)
 
 
 @router.post("/clear")
@@ -225,11 +253,8 @@ def clear_sessions(session_id: Optional[str] = None):
     """
     Clears conversation history.
     """
-    if session_id:
-        if session_id in sessions_db:
-            sessions_db[session_id] = []
-    else:
-        sessions_db.clear()
+    rag_service.session_memory.clear_session(session_id)
+    rag_service.summary_memory.clear_summary(session_id)
     return {"status": "history cleared"}
 
 
